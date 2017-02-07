@@ -34,6 +34,8 @@ def test_transfer_learning(device_id):
         model_file = os.path.join(base_path, *"../../../../Examples/Image/PretrainedModels/ResNet_18.model".split("/"))
         map_file = os.path.join(base_path, *"../../../../Examples/Image/DataSets/CIFAR-10/test_map.txt".split("/"))
 
+    os.chdir(os.path.join(os.path.dirname(map_file), '..'))
+
     feature_node_name = "features"
     last_hidden_node_name = "z.x"
     image_width = 224
