@@ -7,6 +7,10 @@
 #include "CNTKLibrary.h"
 #include "Utils.h"
 #include "Learner.h"
+#ifndef CPUONLY
+#include "cuda_runtime.h"
+#define CUDA_CALL(expr) do {if (cudaSuccess != expr) LogicError("CUDA_FAILURE: "#expr);} while(0)
+#endif
 namespace
 {
     const std::wstring learnersPropertyName = L"Learners";
@@ -15,6 +19,43 @@ namespace
 
 namespace CNTK
 {
+#ifndef CPUONLY
+    struct PinnedScalars
+    {
+        double m_trainingLoss;
+        double m_evalCriterion;
+    };
+
+    class TrainerAsyncScalarData
+    {
+        PinnedScalars* m_pinnedScalars;
+        cudaEvent_t m_scalarDoneEvent;
+
+    public:
+        TrainerAsyncScalarData()
+        {
+            cudaMallocHost(&m_pinnedScalars, sizeof(PinnedScalars));
+            cudaEventCreate(&m_scalarDoneEvent);
+        }
+
+        ~TrainerAsyncScalarData()
+        {
+            cudaFreeHost(m_pinnedScalars);
+            cudaEventDestroy(m_scalarDoneEvent);
+        }
+
+        static PinnedScalars* GetPinnedScalars(void* p)
+        {
+            return ((TrainerAsyncScalarData*)p)->m_pinnedScalars;
+        }
+
+        static cudaEvent_t GetScalarDoneEvent(void* p)
+        {
+            return ((TrainerAsyncScalarData*)p)->m_scalarDoneEvent;
+        }
+    };
+#endif
+
     Trainer::Trainer(const FunctionPtr& model, const FunctionPtr& lossFunction, const std::vector<LearnerPtr>& parameterLearners)
         : Trainer(model, lossFunction, nullptr, parameterLearners)
     {}
@@ -25,7 +66,8 @@ namespace CNTK
           m_evaluationFunction(evaluationFunction),
           m_parameterLearners(std::make_shared<Learners>(parameterLearners)),
           m_prevMinibatchNumSamples(1),
-          m_distributed(false)
+          m_distributed(false),
+          m_pAsyncScalarData(nullptr)
     {
         // By default we set the number of threads to hardware concurrency.
         if (!Internal::MaxNumCPUThreadsSet())
@@ -92,6 +134,16 @@ namespace CNTK
         m_distributed = m_parameterLearners->IsDistributed();
     }
 
+    Trainer::~Trainer()
+    {
+#ifndef CPUONLY
+        if (m_pAsyncScalarData)
+        {
+            delete (TrainerAsyncScalarData*)m_pAsyncScalarData;
+        }
+#endif
+    }
+
     static double GetScalarValue(const ValuePtr& value)
     {
         if (value->Mask())
@@ -119,6 +171,79 @@ namespace CNTK
             LogicError("Unsupported DataType of training loss value");
 
         return scalar;
+    }
+
+    static void GetScalarValueAsyncBegin(const ValuePtr& value, double* pPinnedScalar)
+    {
+        if (value->Mask())
+            LogicError("Scalar Value object cannot have an associated mask");
+
+        auto scalarData = value->Data();
+        if (scalarData->Shape().TotalSize() != 1)
+            LogicError("Scalar Value object's has a size > 1");
+
+        *pPinnedScalar = std::numeric_limits<double>::quiet_NaN();
+
+        if (scalarData->Device() == DeviceDescriptor::CPUDevice())
+        {
+            // CPU device scalar, read directly
+            if (scalarData->GetDataType() == DataType::Float)
+                *pPinnedScalar = *(scalarData->DataBuffer<float>());
+            else if (scalarData->GetDataType() == DataType::Double)
+                *pPinnedScalar = *(scalarData->DataBuffer<double>());
+            else
+                LogicError("Unsupported DataType of training loss value");
+        }
+        else
+        {
+#ifdef CPUONLY
+            LogicError("Unssported device");
+#else
+            // gpu device scalar, use cudaMemcpyAsync on pinned memory
+            if (scalarData->GetDataType() == DataType::Float)
+            {
+                cudaMemcpyAsync(pPinnedScalar, scalarData->DataBuffer<float>(), sizeof(float), cudaMemcpyDeviceToHost);
+            }
+            else if (scalarData->GetDataType() == DataType::Double)
+            {
+                cudaMemcpyAsync(pPinnedScalar, scalarData->DataBuffer<double>(), sizeof(double), cudaMemcpyDeviceToHost);
+            }
+            else
+                LogicError("Unsupported DataType of training loss value");
+#endif
+        }
+    }
+
+    static double GetScalarValueAsyncEnd(const ValuePtr& value, double* pPinnedScalar)
+    {
+        if (value->Mask())
+            LogicError("Scalar Value object cannot have an associated mask");
+
+        auto scalarData = value->Data();
+        if (scalarData->Shape().TotalSize() != 1)
+            LogicError("Scalar Value object's has a size > 1");
+
+        if (scalarData->Device() == DeviceDescriptor::CPUDevice())
+        {
+            return *pPinnedScalar; // float to double conversion is done previously on CPU, no more works needed
+        }
+        else
+        {
+#ifdef CPUONLY
+            LogicError("Unsupported device");
+#else
+            if (scalarData->GetDataType() == DataType::Float)
+            {
+                return (double)(*(float*)pPinnedScalar); // the memory for cudaMemcpyAsync is in float, cast to double
+            }
+            else if (scalarData->GetDataType() == DataType::Double)
+            {
+                return *pPinnedScalar;
+            }
+            else
+                LogicError("Unsupported DataType of training loss value");
+#endif
+        }
     }
 
     static size_t GetSampleCount(const Variable& var, const ValuePtr& value)
@@ -263,6 +388,43 @@ namespace CNTK
         if (m_aggregatedEvaluationFunction)
             m_prevMinibatchAggregateEvalCriterionValue = outputs[m_aggregatedEvaluationFunction];
 
+        // async copy of the scalar values if on GPU
+        double* pTrainingLoss = nullptr;
+        double* pEvalCriterion = nullptr;
+        bool scalarOnGPU =
+            (m_prevMinibatchAggregateTrainingLossValue->Device() != DeviceDescriptor::CPUDevice()) ||
+            (m_aggregatedEvaluationFunction && m_prevMinibatchAggregateEvalCriterionValue->Device() != DeviceDescriptor::CPUDevice());
+
+        if (scalarOnGPU)
+        {
+#ifdef CPUONLY
+            LogicError("Unsupported device");
+#else
+            if (m_pAsyncScalarData == nullptr)
+            {
+                m_pAsyncScalarData = new TrainerAsyncScalarData;
+            }
+            auto pinnedScalars = TrainerAsyncScalarData::GetPinnedScalars(m_pAsyncScalarData);
+            pTrainingLoss = &(pinnedScalars->m_trainingLoss);
+            pEvalCriterion = &(pinnedScalars->m_evalCriterion);
+#endif
+        }
+        else
+        {
+            pTrainingLoss = &m_prevMinibatchAverageTrainingLoss;
+            pEvalCriterion = &m_prevMinibatchAverageEvalCriterion;
+        }
+
+        GetScalarValueAsyncBegin(m_prevMinibatchAggregateTrainingLossValue, pTrainingLoss);
+        if (m_aggregatedEvaluationFunction)
+        {
+            GetScalarValueAsyncBegin(m_prevMinibatchAggregateEvalCriterionValue, pEvalCriterion);
+        }
+
+#ifndef CPUONLY
+        if (scalarOnGPU) cudaEventRecord(TrainerAsyncScalarData::GetScalarDoneEvent(m_pAsyncScalarData));
+#endif
+
         for (auto outputToFetch : outputsToFetch)
         {
             if (outputToFetch.second == nullptr)
@@ -289,6 +451,16 @@ namespace CNTK
         // TODO: Why Backward signature does not take Parameter instead of Variable for gradients?
         m_combinedTrainingFunction->Backward(backPropSate, { { m_aggregatedLossFunction, m_rootGradientValue } }, parameterGradients);
         m_prevMinibatchNumSamples = GetSampleCount(m_trainingSampleCountVar, outputs[m_trainingSampleCountVar]);
+
+#ifndef CPUONLY
+        if (scalarOnGPU) cudaEventSynchronize(TrainerAsyncScalarData::GetScalarDoneEvent(m_pAsyncScalarData));
+#endif
+
+        m_prevMinibatchAverageTrainingLoss = GetScalarValueAsyncEnd(m_prevMinibatchAggregateTrainingLossValue, pTrainingLoss) / m_prevMinibatchNumSamples;
+        if (m_aggregatedEvaluationFunction)
+        {
+            m_prevMinibatchAverageEvalCriterion = GetScalarValueAsyncEnd(m_prevMinibatchAggregateEvalCriterionValue, pEvalCriterion) / m_prevMinibatchNumSamples;
+        }
     }
 
     static std::wstring GetTrainerStateCheckpointFilePath(const std::wstring& modelFilePath)
@@ -371,19 +543,6 @@ namespace CNTK
             return externalState[key].Value<Dictionary>();
         else
             return externalState[std::to_wstring(0)].Value<Dictionary>();
-    }
-
-    double Trainer::PreviousMinibatchLossAverage() const
-    {
-        return (GetScalarValue(m_prevMinibatchAggregateTrainingLossValue) / m_prevMinibatchNumSamples);
-    }
-
-    double Trainer::PreviousMinibatchEvaluationAverage() const
-    {
-        if (!m_evaluationFunction)
-            InvalidArgument("Trainer::PreviousMinibatchEvaluationAverage: Cannot get evaluation criterion value when no evaluation function was specified during 'this' trainer's construction");
-
-        return (GetScalarValue(m_prevMinibatchAggregateEvalCriterionValue) / m_prevMinibatchNumSamples);
     }
 
     const std::vector<LearnerPtr>& Trainer::ParameterLearners() const

@@ -4101,12 +4101,21 @@ namespace CNTK
         ///
         /// Returns the average training loss per sample for the last minibatch trained.
         ///
-        CNTK_API double PreviousMinibatchLossAverage() const;
+        CNTK_API double PreviousMinibatchLossAverage() const
+        {
+            return m_prevMinibatchAverageTrainingLoss;
+        }
 
         ///
         /// Returns the average evaluation criterion value per sample for the last minibatch trained.
         ///
-        CNTK_API double PreviousMinibatchEvaluationAverage() const;
+        CNTK_API double PreviousMinibatchEvaluationAverage() const
+        {
+            if (!m_evaluationFunction)
+                InvalidArgument("Trainer::PreviousMinibatchEvaluationAverage: Cannot get evaluation criterion value when no evaluation function was specified during 'this' trainer's construction");
+
+            return m_prevMinibatchAverageEvalCriterion;
+        }
 
         ///
         /// Returns the number of samples in the last minibatch trained with
@@ -4129,6 +4138,7 @@ namespace CNTK
 
         Trainer(const FunctionPtr& model, const FunctionPtr& lossFunction, const std::vector<LearnerPtr>& parameterLearners);
         Trainer(const FunctionPtr& model, const FunctionPtr& lossFunction, const FunctionPtr& evaluationFunction, const std::vector<LearnerPtr>& parameterLearners);
+        ~Trainer();
 
         void ExecuteForwardBackward(
             const std::unordered_map<Variable, ValuePtr>& arguments,
@@ -4158,6 +4168,10 @@ namespace CNTK
         size_t   m_prevMinibatchNumSamples;
         ValuePtr m_prevMinibatchAggregateTrainingLossValue;
         ValuePtr m_prevMinibatchAggregateEvalCriterionValue;
+        double   m_prevMinibatchAverageTrainingLoss;
+        double   m_prevMinibatchAverageEvalCriterion;
+
+        void*    m_pAsyncScalarData; // a bag of GPU async copy data for scalar, use void* to avoid polluting header
     };
 
     ///
